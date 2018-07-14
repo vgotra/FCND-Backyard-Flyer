@@ -13,9 +13,12 @@ class States(Enum):
     MANUAL = 0
     ARMING = 1
     TAKEOFF = 2
-    WAYPOINT = 3
-    LANDING = 4
-    DISARMING = 5
+    WAYPOINT_ARRIVING = 3
+    WAYPOINT_ARRIVED = 4
+    WAYPOINT_STABILIZATION = 5
+    WAYPOINT = 6
+    LANDING = 7
+    DISARMING = 8
 
 
 class BackyardFlyer(Drone):
@@ -24,109 +27,137 @@ class BackyardFlyer(Drone):
         super().__init__(connection)
         self.target_position = np.array([0.0, 0.0, 0.0])
         self.all_waypoints = []
+        self.expected_local_position = ()
         self.in_mission = True
         self.check_state = {}
+        self.default_altitude = 3.0
 
         # initial state
         self.flight_state = States.MANUAL
 
-        # TODO: Register all your callbacks here
-        self.register_callback(MsgID.LOCAL_POSITION, self.local_position_callback)
+        self.register_callback(MsgID.LOCAL_POSITION,
+                               self.local_position_callback)
         self.register_callback(MsgID.LOCAL_VELOCITY, self.velocity_callback)
         self.register_callback(MsgID.STATE, self.state_callback)
 
-    def local_position_callback(self):
+    def are_close(self, col1, col2):
+        """This function used to compare values of collections with numeric data
         """
-        TODO: Implement this method
+        max_diff = 0.13
+        if (len(col1) != len(col2)):
+            raise ValueError("Different size of input collections")
+        result = []
+        for x, y in zip(col1, col2):
+            result.append(np.abs(np.abs(x) - np.abs(y)) < max_diff)
+        return np.array(result)
 
-        This triggers when `MsgID.LOCAL_POSITION` is received and self.local_position contains new data
-        """
-        pass
+    def local_position_callback(self):
+        if self.flight_state == States.WAYPOINT_ARRIVING:
+            # check are we close to the end of expected location
+            completed = self.are_close(
+                self.local_position, self.expected_local_position[:3])
+            # print("LP: ", self.local_position, ",",
+            #      self.expected_local_position[:3], ",", completed)
+            # if we arrived - slabilize velocity
+            if completed.all():
+                print("waypoint arrived")
+                self.flight_state = States.WAYPOINT_ARRIVED
 
     def velocity_callback(self):
-        """
-        TODO: Implement this method
-
-        This triggers when `MsgID.LOCAL_VELOCITY` is received and self.local_velocity contains new data
-        """
-        pass
+        # in real life this data should be in position callback
+        # to make smooth flights and easy calculations
+        if self.flight_state == States.WAYPOINT_ARRIVED:
+            completed = self.are_close(self.local_velocity, [0, 0, 0])
+            #print("LV: ", self.local_velocity, ", ", completed)
+            # if velocity is stable - check for another waypoint
+            if completed.all():
+                print("waypoint stabilization")
+                self.flight_state = States.WAYPOINT_STABILIZATION
 
     def state_callback(self):
-        """
-        TODO: Implement this method
-
-        This triggers when `MsgID.STATE` is received and self.armed and self.guided contain new data
-        """
-        pass
+        if not self.in_mission:
+            return
+        if self.flight_state == States.MANUAL:
+            self.arming_transition()
+        elif self.flight_state == States.ARMING:
+            self.takeoff_transition()
+        elif self.flight_state == States.TAKEOFF:
+            self.calculate_box()
+            self.waypoint_transition()
+        elif self.flight_state == States.WAYPOINT_ARRIVING:
+            pass  # logic in position callback
+        elif self.flight_state == States.WAYPOINT_ARRIVED:
+            pass  # logic in velocity callback
+        elif self.flight_state == States.WAYPOINT_STABILIZATION:
+            self.waypoint_transition()
+        elif self.flight_state == States.WAYPOINT:
+            self.landing_transition()
+        elif self.flight_state == States.LANDING:
+            self.disarming_transition()
+        elif self.flight_state == States.DISARMING:
+            self.manual_transition()
 
     def calculate_box(self):
-        """TODO: Fill out this method
-        
-        1. Return waypoints to fly a box
-        """
-        pass
+        # using simple square
+        self.all_waypoints = [(5, 0, self.default_altitude, 0), (5, 5, self.default_altitude, 0),
+                              (0, 5, self.default_altitude, 0), (0, 0, self.default_altitude, 0)]
 
     def arming_transition(self):
-        """TODO: Fill out this method
-        
-        1. Take control of the drone
-        2. Pass an arming command
-        3. Set the home location to current position
-        4. Transition to the ARMING state
-        """
         print("arming transition")
+        self.take_control()
+        if self.flight_state == States.MANUAL:
+            self.set_home_position(
+                self.global_position[0], self.global_position[1], self.global_position[2])
+            self.arm()
+            self.flight_state = States.ARMING
 
     def takeoff_transition(self):
-        """TODO: Fill out this method
-        
-        1. Set target_position altitude to 3.0m
-        2. Command a takeoff to 3.0m
-        3. Transition to the TAKEOFF state
-        """
         print("takeoff transition")
+        if self.flight_state == States.ARMING:
+            self.target_position[2] = self.default_altitude
+            self.takeoff(self.default_altitude)
+            self.flight_state = States.TAKEOFF
 
     def waypoint_transition(self):
-        """TODO: Fill out this method
-    
-        1. Command the next waypoint position
-        2. Transition to WAYPOINT state
-        """
         print("waypoint transition")
+        # if we have waipoints take first and fly to it
+        if len(self.all_waypoints) > 0:
+            self.expected_local_position = self.all_waypoints.pop(0)
+            self.cmd_position(*self.expected_local_position)
+            print("waypoint arriving")
+            self.flight_state = States.WAYPOINT_ARRIVING
+        else:
+            # otherwise - just set that waypoints completed
+            # and we should land
+            print("waypoint completed")
+            self.flight_state = States.WAYPOINT
 
     def landing_transition(self):
-        """TODO: Fill out this method
-        
-        1. Command the drone to land
-        2. Transition to the LANDING state
-        """
         print("landing transition")
+        if self.flight_state == States.WAYPOINT:
+            # make landing smooth
+            self.target_position[2] = 0.1
+            self.takeoff(0.1)
+            self.land()
+            self.flight_state = States.LANDING
 
     def disarming_transition(self):
-        """TODO: Fill out this method
-        
-        1. Command the drone to disarm
-        2. Transition to the DISARMING state
-        """
         print("disarm transition")
+        if self.flight_state == States.LANDING:
+            self.disarm()
+            self.flight_state = States.DISARMING
 
     def manual_transition(self):
-        """This method is provided
-        
-        1. Release control of the drone
-        2. Stop the connection (and telemetry log)
-        3. End the mission
-        4. Transition to the MANUAL state
-        """
         print("manual transition")
-
-        self.release_control()
-        self.stop()
-        self.in_mission = False
-        self.flight_state = States.MANUAL
+        if self.flight_state == States.DISARMING:
+            self.release_control()
+            self.stop()
+            self.in_mission = False
+            self.flight_state = States.MANUAL
 
     def start(self):
         """This method is provided
-        
+
         1. Open a log file
         2. Start the drone connection
         3. Close the log file
@@ -142,10 +173,12 @@ class BackyardFlyer(Drone):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=5760, help='Port number')
-    parser.add_argument('--host', type=str, default='127.0.0.1', help="host address, i.e. '127.0.0.1'")
+    parser.add_argument('--host', type=str, default='127.0.0.1',
+                        help="host address, i.e. '127.0.0.1'")
     args = parser.parse_args()
 
-    conn = MavlinkConnection('tcp:{0}:{1}'.format(args.host, args.port), threaded=False, PX4=False)
+    conn = MavlinkConnection('tcp:{0}:{1}'.format(
+        args.host, args.port), threaded=False, PX4=False)
     #conn = WebSocketConnection('ws://{0}:{1}'.format(args.host, args.port))
     drone = BackyardFlyer(conn)
     time.sleep(2)
